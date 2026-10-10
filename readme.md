@@ -1,11 +1,13 @@
 # Ogma
 
-Ogma is a local-first corpus analysis and manuscript-generation workspace for directory trees of Markdown and text notes. It combines semantic retrieval, hierarchical topic modeling, keyword extraction, concept graphs, and GPU-backed long-form writing behind a FastAPI service and React interface.
+Ogma is a local-first note-editing, corpus-analysis, and manuscript-generation workspace for directory trees of Markdown and text notes. It combines a Markdown editor and offline dictionary with semantic retrieval, hierarchical topic modeling, keyword extraction, concept graphs, and GPU-backed long-form writing behind a React interface and local services.
 
 The application mark is a quill, used as the sidebar icon and favicon.
 
 ## Capabilities
 
+- Browse and edit source notes in CodeMirror with Write, Live, and Preview modes.
+- Look up definitions, etymologies, pronunciations, and related words in a local Wiktionary database.
 - Recursively index `.md`, `.txt`, `.markdown`, `.text`, and extensionless text files.
 - Retrieve relevant note excerpts from a persistent ChromaDB vector index.
 - Generate reusable, note-grounded writing plans and human-readable outlines.
@@ -20,12 +22,17 @@ The application mark is a quill, used as the sidebar icon and favicon.
 - Monitor long jobs through Server-Sent Events and cancel running workers.
 - Keep generated artifacts isolated in collision-safe timestamped run directories.
 
-All language-model inference remains local. Ogma does not fine-tune the model or send the note corpus to a cloud API.
+The web workflow runs language-model inference locally and does not fine-tune the model or send
+the note corpus to a cloud API. Legacy fine-tuning experiments remain under `code/train_ai/`
+but are separate from the web application and its runtime dependencies. Initial model and
+dictionary downloads require network access; dictionary lookups use the local database.
 
 ## Architecture
 
 ```text
 React + TypeScript
+    |
+    +-- REST --> Express dictionary service --> SQLite / FTS5
         |
         | REST + Server-Sent Events
         v
@@ -44,13 +51,15 @@ Python analysis and generation scripts
 
 The existing CUDA, quantization, embedding, retrieval, and modeling stack is implemented in Python. FastAPI remains alive between browser requests and delegates long operations to one serialized job queue. Serial execution prevents multiple model processes from competing for GPU memory.
 
-The React application contains no model runtime. It manages controls, server state, live progress, artifacts, charts, and graph interaction.
+The React application contains no model runtime. It manages note editing, controls, server state,
+live progress, artifacts, charts, and graph interaction. FastAPI reads and saves source notes;
+the separate Node.js dictionary service queries Wiktionary through `better-sqlite3`.
 
 ## Repository Layout
 
 ```text
 api/
-    main.py              FastAPI routes, run discovery, SSE streams
+    main.py              FastAPI routes, source file access, run discovery, SSE
     jobs.py              serialized subprocess queue and cancellation
     schemas.py           Pydantic API contracts
 code/
@@ -59,17 +68,25 @@ code/
     analyze_corpus.py    KeyBERT, BERTopic, and graph analysis
     generate_concepts.py concept glossary generation
     chat.py              terminal RAG chat
+    train_ai/            legacy dataset and fine-tuning experiments
 frontend/
     src/                 React UI, API client, charts, graph, SSE hook
+        editor/          CodeMirror editor, live Markdown, lexical inspector
+        lib/dictionary/  SQLite schema, lookup service, fixture tests
+        scripts/         Wiktionary download and ingestion CLI
+        server/          Express dictionary HTTP API
     public/favicon.svg   quill application mark
     package.json         frontend dependencies and scripts
 data/
     input/               source notes, chapter structure, and editable AI guidance
     intermediary/        vector index, writing plans, progress, caches
     output/              human outlines, manuscripts, analyses, exports
+    wiktionary.jsonl     downloaded dictionary source
+    wiktionary.db        generated SQLite dictionary index
 tests/
     test_api.py          API behavior and validation checks
 app.py                   legacy interactive terminal workflow
+run.ps1                  Windows API and frontend launcher
 requirements.txt         Python runtime and test dependencies
 ```
 
@@ -86,12 +103,15 @@ template fields in braces unchanged because the generation code fills them at ru
 ## Prerequisites
 
 - Windows with PowerShell, or an equivalent shell with command adjustments.
-- Python 3.11 or newer. The current workspace uses Python 3.13.
-- Node.js 20 or newer. The current workspace uses Node.js 22.
+- Python 3.11 or newer.
+- Node.js 22.13+ on the 22.x line, or Node.js 24+. The current Vite, ESLint, and
+    `better-sqlite3` dependencies exclude older Node.js releases.
 - NVIDIA CUDA-capable GPU for Qwen manuscript generation.
-- Enough disk space for Hugging Face model caches and the local vector index.
+- Enough disk space for Hugging Face model caches, the local vector index, and, optionally,
+    the multi-gigabyte Wiktionary source plus its SQLite index.
 
 Indexing and BERTopic can use substantial CPU and memory. Qwen generation requires CUDA by default; CPU fallback must be explicitly enabled in the underlying scripts.
+Editing notes and dictionary lookups do not require a GPU.
 
 ## Installation
 
@@ -115,7 +135,19 @@ The first model-backed operation may download sentence-transformer or Qwen weigh
 
 ## Running the Web Application
 
-Start the API from the repository root:
+After installing dependencies, Windows users can start the API and frontend in separate
+PowerShell windows from the repository root:
+
+```powershell
+.\run.ps1
+```
+
+Use `-NoFrontend` to start only the API, or `-NoBackend` to start only the frontend.
+The launcher expects `.venv` to exist and requires frontend port 5173 to be available.
+It does not start the dictionary service; lexical lookups require the separate setup and
+service described under **Build the local Wiktionary index** below.
+
+Alternatively, start the API manually from the repository root:
 
 ```powershell
 .\.venv\Scripts\python.exe -m uvicorn api.main:app --reload --port 8000
@@ -135,8 +167,30 @@ Open:
 - OpenAPI schema: http://127.0.0.1:8000/openapi.json
 
 Set `VITE_API_URL` before starting Vite when the API is not on `http://localhost:8000`.
+Set `VITE_DICTIONARY_API_URL` when the dictionary service is not on `http://127.0.0.1:3001`.
+Both services allow browser origins `http://localhost:5173` and `http://127.0.0.1:5173`;
+using another frontend port requires updating their CORS configuration.
 
 ## Web Workspaces
+
+### Source Editor
+
+The **Editor** workspace provides a searchable folder tree for `data/input/writing-desktop`
+and `data/input/notion/Writing`. It opens existing `.md`, `.markdown`, `.txt`, `.text`, and
+extensionless files, with three document views:
+
+- **Write**: Markdown source editing with CodeMirror.
+- **Live**: editable Markdown with inline formatting.
+- **Preview**: a rendered, read-only view of the current draft.
+
+Use Save, or `Ctrl+S` while editing, to write the draft to the original file. Saves are explicit,
+not automatic. Switching files prompts before discarding unsaved changes; save before leaving
+the Editor or refreshing the browser. FastAPI restricts file access to the two note roots and
+uses atomic file replacement for saves. Saving does not refresh the vector index or completed
+analysis results: rerun indexing or analysis when those should reflect edited notes.
+
+Hover definitions and the selected-word lexical inspector require the separately built
+Wiktionary database and running dictionary service. Basic file editing does not depend on it.
 
 ### Manuscript Operations
 
@@ -265,6 +319,7 @@ python code/write_book.py --system "Tree of Life" --run-id generated202608161531
 ```
 
 Generation is CUDA-only unless `--allow-cpu` is deliberately supplied.
+The default manuscript model is `Qwen/Qwen2.5-3B-Instruct`; use `--model-name` to override it.
 
 ### Analyze a corpus
 
@@ -306,6 +361,8 @@ Additional CLI controls:
 - `--force-download` replaces the raw dataset and database.
 - `--rebuild` rebuilds the database from the existing `data/wiktionary.jsonl` file.
 
+Pass extra flags after `--`, for example `npm run setup:dict -- --rebuild`.
+
 The server-side API in `frontend/src/lib/dictionary/service.ts` exports `lookupWord` /
 `getDefinition` for exact definitions and `searchWords` / `searchPrefix` for FTS-backed search.
 Run its fixture tests with `npm run test:dict`.
@@ -317,10 +374,9 @@ cd frontend
 npm run dict:api
 ```
 
-The service listens only on `127.0.0.1:3001`. The Ogma **Editor** view combines a searchable tree
-of `data/input/writing-desktop` and `data/input/notion/Writing`, CodeMirror Markdown editing,
-`Ctrl+S` saves, live preview, hover definitions, and a full lexical inspector. FastAPI restricts
-file reads and writes to those two note roots and performs saves through atomic file replacement.
+The service binds only to `127.0.0.1`, on port 3001 by default. Set `DICTIONARY_PORT` before
+starting it to change the port, and set the matching `VITE_DICTIONARY_API_URL` before starting
+Vite. Its `/health` endpoint checks the HTTP process only, not whether the dictionary is built.
 
 ### Terminal chat
 
@@ -332,9 +388,14 @@ Commands: `/history`, `/clear`, `/save [file]`, and `/quit`.
 
 ## API Overview
 
+### FastAPI (Port 8000)
+
 | Method | Endpoint | Purpose |
 |---|---|---|
 | `GET` | `/api/health` | Process health |
+| `GET` | `/api/workspace/files` | List editable source files |
+| `GET` | `/api/workspace/file?path=...` | Read a source file |
+| `PUT` | `/api/workspace/file` | Save an existing file with a `{ "path": "...", "content": "..." }` body |
 | `GET` | `/api/index/status` | Vector-index status and metadata |
 | `POST` | `/api/index` | Queue indexing |
 | `GET` | `/api/systems` | Available manuscript systems and section counts |
@@ -342,15 +403,26 @@ Commands: `/history`, `/clear`, `/save [file]`, and `/quit`.
 | `POST` | `/api/outlines` | Queue outline generation or cache reuse |
 | `POST` | `/api/manuscripts` | Queue new/resumed manuscript generation |
 | `GET` | `/api/runs` | Lightweight generated-run summaries |
-| `GET` | `/api/runs/{run}/{system}/artifacts/{kind}` | Read outline, manuscript, or writing plan |
+| `GET` | `/api/runs/{run_id}/{system}/artifacts/{kind}` | Read outline, manuscript, or writing plan |
 | `POST` | `/api/analyses` | Queue KeyBERT/BERTopic/NetworkX analysis |
 | `GET` | `/api/analyses` | Completed analysis summaries |
-| `GET` | `/api/analyses/{run}` | Full analysis payload |
+| `GET` | `/api/analyses/{run_id}` | Full analysis payload |
 | `GET` | `/api/jobs` | Current API-session job history |
-| `GET` | `/api/jobs/{id}/events` | Live SSE job snapshots |
-| `DELETE` | `/api/jobs/{id}` | Cancel queued/running work |
+| `GET` | `/api/jobs/{job_id}` | Single job snapshot |
+| `GET` | `/api/jobs/{job_id}/events` | Live SSE job snapshots |
+| `DELETE` | `/api/jobs/{job_id}` | Cancel queued/running work |
 
-Every request and response body has an explicit Pydantic schema where applicable. The frontend mirrors those contracts in `frontend/src/types.ts`.
+FastAPI uses Pydantic request and response models where applicable. The frontend mirrors those
+contracts in `frontend/src/types.ts`. Workspace paths include their root prefix, for example
+`writing-desktop/notes/example.md` or `notion/Writing/example.md`.
+
+### Dictionary Service (Port 3001)
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| `GET` | `/health` | Dictionary HTTP process health |
+| `GET` | `/api/define/:word` | Exact, case-insensitive word lookup; 404 if absent |
+| `GET` | `/api/search?q=...&limit=20` | Full-text prefix search, with a limit of 1-100 |
 
 ## Validation
 
@@ -360,10 +432,11 @@ Run backend tests:
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
-Run frontend lint and production build:
+Run dictionary fixture tests, frontend lint, and the production build:
 
 ```powershell
 cd frontend
+npm run test:dict
 npm run lint
 npm run build
 ```
@@ -378,7 +451,7 @@ Confirm `data/intermediary/chroma_db/chroma.sqlite3` exists, then rerun `python 
 
 ### CUDA model loading fails
 
-Verify `torch.cuda.is_available()` and the selected GPU environment. Ogma stops rather than silently offloading model parameters to CPU. This avoids locking the computer with a full 7B CPU model.
+Verify `torch.cuda.is_available()` and the selected GPU environment. Ogma stops rather than silently offloading model parameters to CPU, which can make generation very slow and consume substantial system memory.
 
 ### GPU out-of-memory
 
@@ -391,6 +464,19 @@ The Run Library discovers manuscript runs under `data/intermediary/generated*/<b
 ### Frontend cannot reach the API
 
 Confirm FastAPI is listening on port 8000 and that `VITE_API_URL` matches it. Development CORS permits `localhost:5173` and `127.0.0.1:5173`.
+
+### Dictionary lookups fail
+
+From `frontend/`, run `npm run setup:dict` and then keep `npm run dict:api` running in a
+separate terminal. Confirm `data/wiktionary.db` exists and `VITE_DICTIONARY_API_URL` matches
+the service address. A healthy `/health` response alone does not verify the database.
+After an interrupted initial ingestion, use `npm run setup:dict -- --rebuild` to rebuild
+from the downloaded source.
+
+### Frontend installation or tooling rejects Node.js
+
+Use Node.js 22.13+ on the 22.x line, or 24+, and rerun `npm install` in `frontend/` after
+changing Node versions. The dictionary uses a native `better-sqlite3` dependency.
 
 ### Hugging Face warning about unauthenticated requests
 
