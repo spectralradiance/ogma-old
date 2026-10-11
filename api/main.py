@@ -10,25 +10,44 @@ import csv
 from contextlib import asynccontextmanager
 from datetime import datetime
 import json
+import os
 from pathlib import Path
 import re
+import sys
 from typing import Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "code"))
+import paths as data_paths  # noqa: E402 - needs code/ on sys.path first
+
 from api.jobs import JobManager
+from api import model_catalog
 from api.schemas import (
+    AddModelRequest,
     AnalysisRequest,
     AnalysisSummary,
     ArtifactResponse,
+    ChaosStatus,
+    ChatMessage,
+    ChatRequest,
+    ChatSession,
+    ConceptsArtifact,
+    ConceptsRequest,
+    CreatePipelineRunRequest,
+    DownloadModelRequest,
     IndexRequest,
     IndexStatus,
     JobResponse,
     ManuscriptRequest,
+    ModelCatalogEntry,
+    OrganizeChaosRequest,
     OutlineCache,
     OutlineRequest,
+    PipelineRun,
+    PipelineStepFiles,
     RunSummary,
     SystemSummary,
     WorkspaceFileResponse,
@@ -46,28 +65,61 @@ DATA_DIR = ROOT / "data"
 INPUT_DIR = DATA_DIR / "input"
 INTERMEDIARY_DIR = DATA_DIR / "intermediary"
 OUTPUT_DIR = DATA_DIR / "output"
-CSV_FILE = INPUT_DIR / "chapter_structure.csv"
+CSV_FILE = Path(data_paths.CSV_FILE)
 INDEX_METADATA = INTERMEDIARY_DIR / "index_metadata.json"
 DB_FILE = INTERMEDIARY_DIR / "chroma_db" / "chroma.sqlite3"
 PIPELINE_VERSION = "outline-v4"
-DEFAULT_GENERATION_MODEL = "Qwen/Qwen2.5-3B-Instruct"
-SYSTEM_SLUGS = {
-    "Universal Metaphysics": "universal_metaphysics",
-    "Tree of Life": "tree_of_life",
-    "Invocation": "invocation",
-}
+DEFAULT_EXTRACT_MODEL = "Qwen/Qwen2.5-7B-Instruct"
+DEFAULT_WRITE_MODEL = "Qwen/Qwen2.5-7B-Instruct"
+DEFAULT_CLAUDE_MODEL = "claude-opus-5"
+DEFAULT_GENERATION_MODEL = DEFAULT_WRITE_MODEL
 WORKSPACE_ROOTS = {
-    "writing-desktop": INPUT_DIR / "writing-desktop",
-    "notion/Writing": INPUT_DIR / "notion" / "Writing",
+    "writing-desktop": Path(data_paths.NOTES_ROOT),
+    "notion/Writing": Path(data_paths.NOTION_ROOT),
 }
 WORKSPACE_EXTENSIONS = {"", ".md", ".markdown", ".txt", ".text"}
+NOTES_DIR = Path(data_paths.NOTES_ROOT) / "notes"
+CHAOS_IMPORT_SUFFIX = " (chaos import).md"
+RUN_ID_PATTERN = re.compile(r"^generated(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(?:-\d+)?$")
+CHAT_SESSIONS_DIR = INTERMEDIARY_DIR / "chat_sessions"
+SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 manager = JobManager(ROOT)
+
+
+def load_project_env() -> None:
+    """Expose .env values such as CLAUDE_API_KEY to worker subprocesses."""
+    env_path = ROOT / ".env"
+    if not env_path.is_file():
+        return
+    with env_path.open(encoding="utf-8") as env_file:
+        for raw_line in env_file:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip("'").strip('"')
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+
+def generation_provider(request: OutlineRequest | ManuscriptRequest) -> str:
+    if request.provider:
+        return request.provider
+    names = [request.extract_model_name, request.model_name]
+    write_name = getattr(request, "write_model_name", None)
+    if write_name:
+        names.append(write_name)
+    if any(name and name.lower().startswith("claude") for name in names if name):
+        return "claude"
+    return "local"
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     """Create storage roots and bind the job queue to the server event loop."""
+    load_project_env()
     INTERMEDIARY_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     await manager.start()
@@ -78,7 +130,13 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title="Ogma API", version="0.1.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    # Vite auto-increments past 5173 when another local project already owns it,
+    # so the next couple of ports are allowed too rather than only the default.
+    allow_origins=[
+        "http://localhost:5173", "http://127.0.0.1:5173",
+        "http://localhost:5174", "http://127.0.0.1:5174",
+        "http://localhost:5175", "http://127.0.0.1:5175",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -91,6 +149,19 @@ def load_rows() -> list[dict[str, str]]:
         return list(csv.DictReader(csv_file))
 
 
+def slugify_system(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+
+
+def system_slugs() -> dict[str, str]:
+    """Map book names from chapter_structure.csv to filesystem-safe slugs."""
+    slugs: dict[str, str] = {}
+    for row in load_rows():
+        name = row["System"]
+        slugs.setdefault(name, slugify_system(name))
+    return slugs
+
+
 def selected_rows(system: str) -> list[dict[str, str]]:
     """Return only rows explicitly marked for generated prose."""
     return [
@@ -101,9 +172,10 @@ def selected_rows(system: str) -> list[dict[str, str]]:
 
 def ensure_system(system: str) -> str:
     """Validate a public book name and return its filesystem-safe slug."""
-    if system not in SYSTEM_SLUGS:
+    slugs = system_slugs()
+    if system not in slugs:
         raise HTTPException(status_code=422, detail=f"Unknown system: {system}")
-    return SYSTEM_SLUGS[system]
+    return slugs[system]
 
 
 def new_run_id() -> str:
@@ -115,6 +187,19 @@ def new_run_id() -> str:
         candidate = f"{base}-{suffix}"
         suffix += 1
     return candidate
+
+
+def run_created_at(run_id: str) -> datetime | None:
+    """Recover a run's start time from its ``generatedYYYYMMDDHHMM[-N]`` id."""
+    match = RUN_ID_PATTERN.match(run_id)
+    if not match:
+        return None
+    year, month, day, hour, minute = (int(part) for part in match.groups())
+    return datetime(year, month, day, hour, minute).astimezone()
+
+
+def concepts_dir(run_id: str) -> Path:
+    return OUTPUT_DIR / run_id / "concepts"
 
 
 def parse_plan_count(path: Path) -> int:
@@ -302,9 +387,43 @@ async def start_index(request: IndexRequest) -> JobResponse:
     return await manager.submit("index", arguments)
 
 
+@app.get("/api/organize-chaos/status", response_model=ChaosStatus)
+async def organize_chaos_status() -> ChaosStatus:
+    unsorted_dir = NOTES_DIR / "_unsorted"
+    unsorted_files = list(unsorted_dir.glob("*.md")) if unsorted_dir.is_dir() else []
+    imported_files = list(NOTES_DIR.rglob(f"*{CHAOS_IMPORT_SUFFIX}")) if NOTES_DIR.is_dir() else []
+    newest = max(unsorted_files + imported_files, key=lambda p: p.stat().st_mtime, default=None)
+    last_run_at = datetime.fromtimestamp(newest.stat().st_mtime).astimezone() if newest else None
+    return ChaosStatus(
+        unsorted_files=len(unsorted_files),
+        imported_files=len(imported_files),
+        last_run_at=last_run_at,
+    )
+
+
+@app.post("/api/organize-chaos", response_model=JobResponse, status_code=202)
+async def start_organize_chaos(request: OrganizeChaosRequest) -> JobResponse:
+    # Matching runs over the full chaos tree; treat repeats as reconnects.
+    active = manager.active("organize_chaos")
+    if active is not None:
+        return active.response()
+    arguments = [str(CODE_DIR / "organize_chaos.py")]
+    if request.dry_run:
+        arguments.append("--dry-run")
+    if request.threshold is not None:
+        arguments.extend(["--threshold", str(request.threshold)])
+    if request.run_id and not request.dry_run:
+        manifest = OUTPUT_DIR / request.run_id / "organize-chaos" / "manifest.json"
+        arguments.extend(["--run-id", request.run_id, "--manifest-out", str(manifest)])
+    return await manager.submit("organize_chaos", arguments, run_id=request.run_id)
+
+
 @app.get("/api/systems", response_model=list[SystemSummary])
 async def systems() -> list[SystemSummary]:
-    return [SystemSummary(name=system, sections=len(selected_rows(system))) for system in SYSTEM_SLUGS]
+    return [
+        SystemSummary(name=system, sections=len(selected_rows(system)))
+        for system in system_slugs()
+    ]
 
 
 @app.get("/api/outlines/{system}/caches", response_model=list[OutlineCache])
@@ -317,13 +436,20 @@ async def start_outline(request: OutlineRequest) -> JobResponse:
     ensure_system(request.system)
     if request.cache_path and request.regenerate:
         raise HTTPException(status_code=422, detail="Choose cache reuse or regeneration")
-    run_id = new_run_id()
+    run_id = request.run_id or new_run_id()
+    provider = generation_provider(request)
+    extract_name = request.extract_model_name or request.model_name
+    if provider == "claude":
+        extract_name = extract_name or DEFAULT_CLAUDE_MODEL
+    else:
+        extract_name = extract_name or DEFAULT_EXTRACT_MODEL
     arguments = [
         str(CODE_DIR / "write_book.py"),
         "--system", request.system,
         "--run-id", run_id,
         "--outline-only",
-        "--model-name", request.model_name or DEFAULT_GENERATION_MODEL,
+        "--provider", provider,
+        "--extract-model-name", extract_name,
     ]
     if request.cache_path:
         arguments.extend(["--outline-cache", str(validate_cache(request.cache_path))])
@@ -338,11 +464,22 @@ async def start_manuscript(request: ManuscriptRequest) -> JobResponse:
     run_id = request.run_id or new_run_id()
     if request.run_id and not (INTERMEDIARY_DIR / run_id / slug).exists():
         raise HTTPException(status_code=404, detail="Run not found for this system")
+    provider = generation_provider(request)
+    extract_name = request.extract_model_name or request.model_name
+    write_name = request.write_model_name or request.model_name
+    if provider == "claude":
+        extract_name = extract_name or DEFAULT_CLAUDE_MODEL
+        write_name = write_name or DEFAULT_CLAUDE_MODEL
+    else:
+        extract_name = extract_name or DEFAULT_EXTRACT_MODEL
+        write_name = write_name or DEFAULT_WRITE_MODEL
     arguments = [
         str(CODE_DIR / "write_book.py"),
         "--system", request.system,
         "--run-id", run_id,
-        "--model-name", request.model_name or DEFAULT_GENERATION_MODEL,
+        "--provider", provider,
+        "--extract-model-name", extract_name,
+        "--write-model-name", write_name,
     ]
     if request.cache_path:
         arguments.extend(["--outline-cache", str(validate_cache(request.cache_path))])
@@ -358,7 +495,7 @@ async def start_analysis(request: AnalysisRequest) -> JobResponse:
     active = manager.active("analysis")
     if active is not None:
         return active.response()
-    run_id = new_run_id()
+    run_id = request.run_id or new_run_id()
     arguments = [
         str(CODE_DIR / "analyze_corpus.py"),
         "--run-id", run_id,
@@ -366,6 +503,8 @@ async def start_analysis(request: AnalysisRequest) -> JobResponse:
     ]
     if request.min_topic_size is not None:
         arguments.extend(["--min-topic-size", str(request.min_topic_size)])
+    if request.embedding_model:
+        arguments.extend(["--embedding-model", request.embedding_model])
     if request.source:
         source = Path(request.source).resolve()
         if not source.is_dir():
@@ -391,6 +530,7 @@ async def analyses() -> list[AnalysisSummary]:
             run_id=payload["run_id"],
             created_at=payload["created_at"],
             source=payload["source"],
+            embedding_model=payload.get("embedding_model"),
             document_count=payload["document_count"],
             keyword_count=len(payload.get("keywords", [])),
             topic_count=len([topic for topic in payload.get("topics", []) if topic.get("Topic", -1) >= 0]),
@@ -406,9 +546,268 @@ async def analysis(run_id: str) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+@app.post("/api/concepts", response_model=JobResponse, status_code=202)
+async def start_concepts(request: ConceptsRequest) -> JobResponse:
+    active = manager.active("concepts")
+    if active is not None:
+        return active.response()
+    provider = request.provider or "local"
+    extract_name = request.extract_model_name or (
+        DEFAULT_CLAUDE_MODEL if provider == "claude" else DEFAULT_EXTRACT_MODEL
+    )
+    run_id = request.run_id or new_run_id()
+    out_dir = concepts_dir(run_id)
+    arguments = [
+        str(CODE_DIR / "generate_concepts.py"),
+        "--target-count", str(request.target_count),
+        "--provider", provider,
+        "--extract-model-name", extract_name,
+        "--output", str(out_dir / "concepts.md"),
+        "--csv-output", str(out_dir / "concepts.csv"),
+    ]
+    for system in request.systems or []:
+        arguments.extend(["--system", system])
+    return await manager.submit("concepts", arguments, run_id=run_id)
+
+
+@app.get("/api/concepts", response_model=ConceptsArtifact)
+async def concepts_artifact(run_id: str) -> ConceptsArtifact:
+    path = concepts_dir(run_id) / "concepts.md"
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Concepts glossary not generated yet for this run")
+    stat = path.stat()
+    return ConceptsArtifact(
+        content=path.read_text(encoding="utf-8"),
+        modified_at=datetime.fromtimestamp(stat.st_mtime).astimezone(),
+    )
+
+
+def discover_run_ids() -> list[str]:
+    """Every run_id with any known output, newest first."""
+    ids = set()
+    for base in (OUTPUT_DIR, INTERMEDIARY_DIR):
+        if base.is_dir():
+            ids.update(p.name for p in base.glob("generated*") if p.is_dir())
+    return sorted(ids, reverse=True)
+
+
+def run_config_path(run_id: str) -> Path:
+    return OUTPUT_DIR / run_id / "run_config.json"
+
+
+def read_run_config(run_id: str) -> dict:
+    path = run_config_path(run_id)
+    if not path.is_file():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def pipeline_run_summary(run_id: str) -> PipelineRun:
+    created = run_created_at(run_id) or datetime.now().astimezone()
+    run_config = read_run_config(run_id)
+    steps = []
+
+    manifest_path = OUTPUT_DIR / run_id / "organize-chaos" / "manifest.json"
+    manifest_files: list[str] = []
+    manifest_detail = None
+    if manifest_path.is_file():
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest_files = payload.get("files", [])
+            manifest_detail = (
+                f"{payload.get('matched_by_heading', 0)} by heading, "
+                f"{payload.get('matched', 0)} by embedding, {payload.get('unsorted', 0)} unsorted"
+            )
+        except (json.JSONDecodeError, OSError):
+            pass
+    steps.append(PipelineStepFiles(
+        step="organize_chaos", label="Organize chaos",
+        done=manifest_path.is_file(), detail=manifest_detail, files=manifest_files,
+    ))
+
+    index_done = False
+    index_detail = None
+    index_files = []
+    if INDEX_METADATA.is_file():
+        try:
+            meta = json.loads(INDEX_METADATA.read_text(encoding="utf-8"))
+            completed = meta.get("completed_at")
+            if completed:
+                index_done = datetime.fromisoformat(completed) >= created
+            index_detail = f"{meta.get('total_chunks', 0)} chunks · shared index, last refreshed {completed}"
+            index_files = [str(DB_FILE), str(INDEX_METADATA)]
+        except (json.JSONDecodeError, OSError, ValueError):
+            pass
+    steps.append(PipelineStepFiles(step="index", label="Index notes", done=index_done, detail=index_detail, files=index_files))
+
+    analysis_path = OUTPUT_DIR / run_id / "analysis" / "analysis.json"
+    steps.append(PipelineStepFiles(
+        step="analysis", label="Analyze corpus",
+        done=analysis_path.is_file(), files=[str(analysis_path)] if analysis_path.is_file() else [],
+    ))
+
+    concepts_files = [str(p) for p in concepts_dir(run_id).glob("concepts.*") if p.is_file()]
+    steps.append(PipelineStepFiles(step="concepts", label="Generate concepts", done=bool(concepts_files), files=concepts_files))
+
+    try:
+        systems = system_slugs()
+    except (OSError, KeyError):
+        # chapter_structure.csv missing/malformed shouldn't take down the whole
+        # run summary — organize_chaos/index/analysis/concepts don't depend on it.
+        systems = {}
+    for system, slug in systems.items():
+        outline = OUTPUT_DIR / run_id / slug / "outline.md"
+        manuscript = OUTPUT_DIR / run_id / slug / "manuscript.md"
+        files = [str(p) for p in (outline, manuscript) if p.is_file()]
+        if files:
+            steps.append(PipelineStepFiles(step=f"write:{slug}", label=f"Write · {system}", done=manuscript.is_file(), files=files))
+
+    return PipelineRun(
+        run_id=run_id,
+        created_at=created,
+        steps=steps,
+        generation_model=run_config.get("generation_model"),
+        embedding_model=run_config.get("embedding_model"),
+    )
+
+
+@app.get("/api/pipeline-runs", response_model=list[PipelineRun])
+async def pipeline_runs() -> list[PipelineRun]:
+    return [pipeline_run_summary(run_id) for run_id in discover_run_ids()]
+
+
+@app.post("/api/pipeline-runs", response_model=PipelineRun, status_code=201)
+async def create_pipeline_run(request: CreatePipelineRunRequest | None = None) -> PipelineRun:
+    request = request or CreatePipelineRunRequest()
+    run_id = new_run_id()
+    # Models are fixed at run creation and never touched again, so every step
+    # triggered under this run_id keeps using the same generation/embedding
+    # model regardless of what the picker elsewhere in the UI is later set to.
+    path = run_config_path(run_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({
+            "generation_model": request.generation_model,
+            "embedding_model": request.embedding_model,
+        }, indent=2),
+        encoding="utf-8",
+    )
+    return pipeline_run_summary(run_id)
+
+
+@app.get("/api/models", response_model=list[ModelCatalogEntry])
+async def list_models() -> list[dict]:
+    return model_catalog.full_catalog(INTERMEDIARY_DIR)
+
+
+@app.post("/api/models", response_model=list[ModelCatalogEntry], status_code=201)
+async def add_model(request: AddModelRequest) -> list[dict]:
+    if request.value in model_catalog.BUILTIN_VALUES:
+        raise HTTPException(status_code=409, detail=f"{request.value} is already a built-in model")
+    custom = model_catalog.load_custom_models(INTERMEDIARY_DIR)
+    if any(entry["value"] == request.value for entry in custom):
+        raise HTTPException(status_code=409, detail=f"{request.value} was already added")
+    custom.append(request.model_dump())
+    model_catalog.save_custom_models(INTERMEDIARY_DIR, custom)
+    return model_catalog.full_catalog(INTERMEDIARY_DIR)
+
+
+@app.delete("/api/models/{value:path}", response_model=list[ModelCatalogEntry])
+async def remove_model(value: str) -> list[dict]:
+    if value in model_catalog.BUILTIN_VALUES:
+        raise HTTPException(status_code=409, detail="Built-in models can't be removed")
+    custom = model_catalog.load_custom_models(INTERMEDIARY_DIR)
+    remaining = [entry for entry in custom if entry["value"] != value]
+    if len(remaining) == len(custom):
+        raise HTTPException(status_code=404, detail=f"{value} was not found in the custom catalog")
+    model_catalog.save_custom_models(INTERMEDIARY_DIR, remaining)
+    return model_catalog.full_catalog(INTERMEDIARY_DIR)
+
+
+@app.post("/api/models/download", response_model=JobResponse, status_code=202)
+async def download_model(request: DownloadModelRequest) -> JobResponse:
+    catalog = {entry["value"]: entry for entry in model_catalog.full_catalog(INTERMEDIARY_DIR)}
+    entry = catalog.get(request.value)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"{request.value} is not in the model catalog")
+    if entry["provider"] != "local":
+        raise HTTPException(status_code=422, detail="Only local Hugging Face models can be pre-downloaded")
+    arguments = [str(CODE_DIR / "download_model.py"), "--model-name", request.value]
+    return await manager.submit("download_model", arguments)
+
+
+def chat_session_path(session_id: str) -> Path:
+    if not SESSION_ID_PATTERN.match(session_id):
+        raise HTTPException(status_code=422, detail="Invalid chat session id")
+    return CHAT_SESSIONS_DIR / f"{session_id}.json"
+
+
+def read_chat_session(session_id: str) -> ChatSession:
+    path = chat_session_path(session_id)
+    if not path.is_file():
+        return ChatSession(session_id=session_id, messages=[])
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        messages = [ChatMessage(**item) for item in raw if item.get("role") in {"user", "assistant"}]
+    except (json.JSONDecodeError, OSError, TypeError, ValueError):
+        messages = []
+    return ChatSession(
+        session_id=session_id,
+        updated_at=datetime.fromtimestamp(path.stat().st_mtime).astimezone(),
+        messages=messages,
+    )
+
+
+@app.get("/api/chat/sessions", response_model=list[ChatSession])
+async def chat_sessions() -> list[ChatSession]:
+    if not CHAT_SESSIONS_DIR.is_dir():
+        return []
+    sessions = [read_chat_session(p.stem) for p in CHAT_SESSIONS_DIR.glob("*.json")]
+    return sorted(sessions, key=lambda s: s.updated_at or datetime.min.astimezone(), reverse=True)
+
+
+@app.get("/api/chat/{session_id}", response_model=ChatSession)
+async def chat_session(session_id: str) -> ChatSession:
+    return read_chat_session(session_id)
+
+
+@app.delete("/api/chat/{session_id}")
+async def clear_chat_session(session_id: str) -> dict:
+    chat_session_path(session_id).unlink(missing_ok=True)
+    return {"status": "cleared"}
+
+
+@app.post("/api/chat", response_model=JobResponse, status_code=202)
+async def start_chat(request: ChatRequest) -> JobResponse:
+    # One reply at a time, same GPU-serialization rule as every other job —
+    # but a session mid-reply should reconnect to it, not queue a duplicate.
+    active = manager.active("chat")
+    if active is not None and active.system == request.session_id:
+        return active.response()
+    provider = request.provider or "local"
+    model_name = request.model_name or (DEFAULT_CLAUDE_MODEL if provider == "claude" else "Qwen/Qwen2.5-7B-Instruct")
+    path = chat_session_path(request.session_id)
+    arguments = [
+        str(CODE_DIR / "chat.py"),
+        "--message", request.message,
+        "--history-file", str(path),
+        "--provider", provider,
+        "--model-name", model_name,
+    ]
+    if request.top_k is not None:
+        arguments.extend(["--top-k", str(request.top_k)])
+    if request.no_rag:
+        arguments.append("--no-rag")
+    return await manager.submit("chat", arguments, system=request.session_id)
+
+
 @app.get("/api/runs", response_model=list[RunSummary])
 async def runs(system: str | None = None) -> list[RunSummary]:
-    requested = [system] if system else list(SYSTEM_SLUGS)
+    slugs = system_slugs()
+    requested = [system] if system else list(slugs)
     for item in requested:
         ensure_system(item)
     run_dirs = sorted(INTERMEDIARY_DIR.glob("generated*"), reverse=True)
@@ -417,7 +816,7 @@ async def runs(system: str | None = None) -> list[RunSummary]:
         if not run_dir.is_dir():
             continue
         for item in requested:
-            slug = SYSTEM_SLUGS[item]
+            slug = slugs[item]
             if (run_dir / slug).exists() or (OUTPUT_DIR / run_dir.name / slug).exists():
                 summaries.append(run_summary(run_dir, item))
     return sorted(summaries, key=lambda item: item.modified_at, reverse=True)

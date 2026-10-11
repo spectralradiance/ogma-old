@@ -63,6 +63,7 @@ api/
     jobs.py              serialized subprocess queue and cancellation
     schemas.py           Pydantic API contracts
 code/
+    organize_chaos.py    route raw chaos/ notes into the organized notes/ tree
     index_notes.py       recursive text indexing into ChromaDB
     write_book.py        writing-plan, outline, and manuscript generation
     analyze_corpus.py    KeyBERT, BERTopic, and graph analysis
@@ -92,10 +93,17 @@ requirements.txt         Python runtime and test dependencies
 
 ## Editing AI Guidance
 
-Model-facing editorial instructions live in `data/input/guidance.json`. This file controls the
-outline and manuscript prompts, manuscript style progression, concept extraction, chat behavior,
+Model-facing editorial instructions live in `data/input/guidance/guidance.json`. This file controls
+the outline and manuscript prompts, manuscript style progression, concept extraction, chat behavior,
 and legacy training prompts. Runtime values such as section metadata, retrieved note excerpts,
-paragraph counts, and output schemas are still assembled by the Python code.
+and output schemas are still assembled by the Python code.
+
+Where `data/input/guidance/chapter-profiles.md` profiles a chapter (currently Invocation,
+Evocation, and the Universal Metaphysics introduction), its Description/Belongs-here/Keywords text
+is added to that chapter's outline and manuscript prompts as authoritative guidance, alongside
+retrieved note excerpts. This is optional enrichment on top of `chapter_structure.csv`, not a
+replacement for it — the CSV still determines which sections exist at all; chapters the profile
+document doesn't cover generate exactly as before.
 
 Restart a running API or command after changing the guidance file so it is loaded again. Keep the
 template fields in braces unchanged because the generation code fills them at runtime.
@@ -131,7 +139,7 @@ npm install
 cd ..
 ```
 
-The first model-backed operation may download sentence-transformer or Qwen weights from Hugging Face. Setting `HF_TOKEN` is optional but raises download rate limits.
+The first model-backed operation may download sentence-transformer or Qwen weights from Hugging Face. Setting `HF_TOKEN` is optional but raises download rate limits. Paid Claude generation reads `CLAUDE_API_KEY` from `.env` and sends only retrieved excerpts, not the full note tree.
 
 ## Running the Web Application
 
@@ -175,8 +183,8 @@ using another frontend port requires updating their CORS configuration.
 
 ### Source Editor
 
-The **Editor** workspace provides a searchable folder tree for `data/input/writing-desktop`
-and `data/input/notion/Writing`. It opens existing `.md`, `.markdown`, `.txt`, `.text`, and
+The **Editor** workspace provides a searchable folder tree for `data/input/random/writing-desktop`
+and `data/input/random/notion/Writing`. It opens existing `.md`, `.markdown`, `.txt`, `.text`, and
 extensionless files, with three document views:
 
 - **Write**: Markdown source editing with CodeMirror.
@@ -192,13 +200,44 @@ analysis results: rerun indexing or analysis when those should reflect edited no
 Hover definitions and the selected-word lexical inspector require the separately built
 Wiktionary database and running dictionary service. Basic file editing does not depend on it.
 
+### Pipeline
+
+The landing workspace is a single, linear view of the whole corpus-to-manuscript flow: organize
+chaos, index notes, analyze the corpus, generate a concept glossary, and write manuscripts. Each
+stage shows its own status (counts, last-run time, or live progress while a job is running) and a
+primary action that starts it with sensible defaults. Stages that already have a dedicated
+workspace (Analysis, Workspace, Run Library) also link out to it for deeper configuration; the
+Pipeline view itself is where you see how the stages connect and trigger any of them without
+leaving the browser.
+
+Organize chaos routes raw, unstructured notes under `data/input/random/writing-desktop/chaos` into
+the destinations profiled in `data/input/guidance/chapter-profiles.md` — the sole source of routing
+structure; nothing under `data/input/random/` (including its own `outlines/` folder) is treated as
+guiding structure, only as content. Each profile's Description, Belongs-here text, and Keywords are
+embedded once as a fixed target, so matching doesn't drift as content accumulates the way matching
+against ever-growing notes-file content would.
+
+Two passes classify each chaos file. First, any markdown heading that names a destination directly
+(`## 1 protasis`, `## sacrifice`, ...) is routed there immediately — no embedding needed, the title
+already says where it goes. Whatever isn't captured that way (preamble text, and any heading that
+doesn't name a destination) falls through to embedding-based matching with `BAAI/bge-large-en-v1.5`:
+outline-style sections are merged until they carry enough context to embed meaningfully (most
+headings in this stream-of-consciousness corpus introduce only a line or two on their own), then
+matched against the nearest destination by cosine similarity, requiring `--threshold 0.65` (calibrated
+for this model's higher, more compressed score range than MiniLM's) before accepting a match.
+
+Either way, matches are appended to a `<name> (chaos import).md` sibling next to the destination,
+tagged with their chaos source path so they stay traceable and are never imported twice. Chaos files
+themselves are never modified or deleted. Sections with no confident match are grouped by chaos
+top-level range folder under `notes/_unsorted/` for manual review.
+
 ### Manuscript Operations
 
 The main workspace displays index health, available texts, generated runs, compatible writing-plan caches, and recent background activity.
 
 A new manuscript run performs these stages:
 
-1. Read `data/input/chapter_structure.csv`.
+1. Read `data/input/guidance/chapter_structure.csv`.
 2. Select rows whose `Generate Text` value is `Yes`.
 3. Retrieve relevant indexed excerpts for every selected section.
 4. Generate or reuse the complete machine writing plan.
@@ -219,7 +258,9 @@ The Analysis workspace processes every eligible document under `data/input/writi
 The worker:
 
 1. Traverses the complete selected source directory and reads bounded text samples.
-2. Embeds documents with `all-MiniLM-L6-v2`.
+2. Embeds documents with a selectable model (`BAAI/bge-large-en-v1.5` by default; `bge-base` and
+   `all-MiniLM-L6-v2` are also available for faster, lower-quality runs). Unlike the index's
+   embedding model, this choice only affects this run's clustering and is safe to change freely.
 3. Extracts diverse phrases with KeyBERT and maximal marginal relevance.
 4. Fits BERTopic using precomputed embeddings and `KeyBERTInspired` labels.
 5. Maps topic frequencies to relative source directories with `topics_per_class`.
@@ -249,9 +290,11 @@ Cancelling a Windows worker sends `CTRL_BREAK_EVENT`, allowing Python code to fl
 Manuscript metadata and source files remain under `data/input`. Corpus Intelligence analyzes only `writing-desktop`:
 
 ```text
-data/input/chapter_structure.csv
-data/input/writing-desktop/
-data/input/notion/Writing/
+data/input/guidance/chapter_structure.csv
+data/input/guidance/guidance.json
+data/input/guidance/chapter-profiles.md
+data/input/random/writing-desktop/
+data/input/random/notion/Writing/
 ```
 
 The shared vector store is:
@@ -283,6 +326,20 @@ Minute collisions receive `-2`, `-3`, and subsequent suffixes. New runs therefor
 ## Direct Script Usage
 
 The web interface is recommended, but each worker remains independently usable.
+
+### Organize chaos into notes
+
+```powershell
+python code/organize_chaos.py --dry-run
+python code/organize_chaos.py
+```
+
+`--dry-run` reports match-score percentiles and a sample of borderline sections without writing
+anything. Useful controls:
+
+- `--threshold` sets the minimum cosine similarity required for a confident match (default `0.65`).
+- `--profiles` points at the chapter-profiles document (default `data/input/guidance/chapter-profiles.md`).
+- `--limit-files N` processes only the first N chaos files, for quick prototyping.
 
 ### Index notes
 
@@ -318,8 +375,16 @@ python code/write_book.py --system "Universal Metaphysics" --outline-only
 python code/write_book.py --system "Tree of Life" --run-id generated202608161531
 ```
 
-Generation is CUDA-only unless `--allow-cpu` is deliberately supplied.
-The default manuscript model is `Qwen/Qwen2.5-3B-Instruct`; use `--model-name` to override it.
+Local generation is CUDA-only unless `--allow-cpu` is deliberately supplied.
+The default local model is `Qwen/Qwen2.5-7B-Instruct`; use `--model-name` (or
+`--extract-model-name`/`--write-model-name`) to override it.
+
+Use Claude instead of a local GPU model. The vector index stays on disk; only the retrieved excerpts for the current section are sent:
+
+```powershell
+python code/write_book.py --system Invocation --provider claude --run-id claude-invocation
+python code/generate_concepts.py --provider claude --system Invocation --system Evocation
+```
 
 ### Analyze a corpus
 
@@ -332,6 +397,7 @@ Useful controls:
 - `--max-chars` bounds each document sample.
 - `--min-topic-size` controls BERTopic cluster granularity.
 - `--run-id` selects the output directory name.
+- `--embedding-model` selects the sentence-transformers model (default `BAAI/bge-large-en-v1.5`).
 
 ### Generate a concept glossary
 
@@ -398,6 +464,8 @@ Commands: `/history`, `/clear`, `/save [file]`, and `/quit`.
 | `PUT` | `/api/workspace/file` | Save an existing file with a `{ "path": "...", "content": "..." }` body |
 | `GET` | `/api/index/status` | Vector-index status and metadata |
 | `POST` | `/api/index` | Queue indexing |
+| `GET` | `/api/organize-chaos/status` | Chaos-import counts and last-run time |
+| `POST` | `/api/organize-chaos` | Queue chaos-to-notes routing |
 | `GET` | `/api/systems` | Available manuscript systems and section counts |
 | `GET` | `/api/outlines/{system}/caches` | Compatible writing-plan caches |
 | `POST` | `/api/outlines` | Queue outline generation or cache reuse |
@@ -407,6 +475,8 @@ Commands: `/history`, `/clear`, `/save [file]`, and `/quit`.
 | `POST` | `/api/analyses` | Queue KeyBERT/BERTopic/NetworkX analysis |
 | `GET` | `/api/analyses` | Completed analysis summaries |
 | `GET` | `/api/analyses/{run_id}` | Full analysis payload |
+| `POST` | `/api/concepts` | Queue concept glossary generation |
+| `GET` | `/api/concepts` | Read the generated concept glossary |
 | `GET` | `/api/jobs` | Current API-session job history |
 | `GET` | `/api/jobs/{job_id}` | Single job snapshot |
 | `GET` | `/api/jobs/{job_id}/events` | Live SSE job snapshots |

@@ -6,28 +6,60 @@ Usage:
     python index_notes.py [--notes-dirs PATH [PATH ...]] [--db-dir PATH]
 
 Defaults (two source dirs):
-    ../data/input/writing-desktop
-    ../data/input/notion/Writing
+    ../data/input/random/writing-desktop
+    ../data/input/random/notion/Writing
 """
 
 import argparse
 from datetime import datetime
 import json
 import os
+import sys
 
 import chromadb
 from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
 from tqdm import tqdm
 
+# Tests may load this file via importlib rather than running it directly,
+# which doesn't add code/ to sys.path automatically.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import paths
+
 
 CHUNK_SIZE = 1400        # characters
 CHUNK_OVERLAP = 250      # characters
-BATCH_SIZE = 500         # chunks per ChromaDB upsert call
+BATCH_SIZE = 32          # chunks per ChromaDB upsert; keep this small to limit RAM spikes
+MAX_FILE_BYTES = 1_048_576  # skip files over 1 MB; they freeze low-RAM machines
 TEXT_EXTENSIONS = {".md", ".txt", ".markdown", ".text", ""}
 # Byte-order marks / null bytes indicate a binary file; skip them
 _BINARY_SIGNALS = (b"\x00", b"\xff\xfe", b"\xfe\xff", b"\x89PNG", b"PK\x03")
 COLLECTION_NAME = "notes"
-INDEX_VERSION = 2
+# write_book.py, generate_concepts.py, and chat.py all query this same store and
+# must embed with this exact model, so it cannot be picked per-run like the
+# analysis/generation models can. Changing it requires bumping INDEX_VERSION
+# below so the mismatched-dimension collection is rebuilt instead of erroring.
+EMBEDDING_MODEL = "BAAI/bge-large-en-v1.5"
+INDEX_VERSION = 3
+
+
+def _prefer_below_normal_priority() -> None:
+    """Keep the desktop responsive while embedding thousands of notes."""
+    if os.name != "nt":
+        return
+    import ctypes
+    handle = ctypes.windll.kernel32.GetCurrentProcess()
+    ctypes.windll.kernel32.SetPriorityClass(handle, 0x00004000)
+
+
+def _embedding_device() -> str:
+    try:
+        import torch
+        torch.set_num_threads(2)
+        if torch.cuda.is_available():
+            return "cuda"
+    except Exception:
+        pass
+    return "cpu"
 
 
 def _is_text_file(path: str) -> bool:
@@ -46,6 +78,11 @@ def iter_text_files(root: str):
             if ext not in TEXT_EXTENSIONS:
                 continue
             fpath = os.path.join(dirpath, fname)
+            try:
+                if os.path.getsize(fpath) > MAX_FILE_BYTES:
+                    continue
+            except OSError:
+                continue
             if _is_text_file(fpath):
                 yield fpath
 
@@ -69,10 +106,7 @@ def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     data_dir = os.path.join(os.path.dirname(script_dir), "data")
     input_dir = os.path.join(data_dir, "input")
-    default_dirs = [
-        os.path.join(data_dir, "input", "writing-desktop"),
-        os.path.join(data_dir, "input", "notion", "Writing"),
-    ]
+    default_dirs = [paths.NOTES_ROOT, paths.NOTION_ROOT]
     default_db = os.path.join(data_dir, "intermediary", "chroma_db")
     default_metadata = os.path.join(data_dir, "intermediary", "index_metadata.json")
 
@@ -89,12 +123,18 @@ def main():
         if not os.path.isdir(d):
             raise SystemExit(f"Notes directory not found: {d}")
 
+    _prefer_below_normal_priority()
+    device = _embedding_device()
     print(f"Source dirs ({len(notes_dirs)}):")
     for d in notes_dirs:
         print(f"  {d}")
     print(f"ChromaDB  : {db_dir}")
+    print(f"Embeddings: {EMBEDDING_MODEL} on {device}, {BATCH_SIZE} chunks/batch, skip files > {MAX_FILE_BYTES} bytes")
 
-    ef = SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
+    ef = SentenceTransformerEmbeddingFunction(
+        model_name=EMBEDDING_MODEL,
+        device=device,
+    )
     client = chromadb.PersistentClient(path=db_dir)
     collection = client.get_or_create_collection(
         name=COLLECTION_NAME,
@@ -118,7 +158,9 @@ def main():
             metadata={"hnsw:space": "cosine"},
         )
 
-    existing_ids: set[str] = set(collection.get(include=[])["ids"])
+    existing_ids: set[str] = set()
+    if collection.count():
+        existing_ids = set(collection.get(include=[])["ids"])
     print(f"Existing chunks in store: {len(existing_ids)}")
 
     all_files = []
@@ -178,6 +220,7 @@ def main():
     print(f"Total chunks in store: {collection.count()}")
     metadata = {
         "index_version": INDEX_VERSION,
+        "embedding_model": EMBEDDING_MODEL,
         "completed_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "source_dirs": notes_dirs,
         "files_found": len(all_files),

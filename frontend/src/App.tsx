@@ -1,17 +1,34 @@
 import { lazy, Suspense, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Activity, BookOpenText, Clock3, Database, FileText, Library, LoaderCircle, Network, PencilLine, Play, RefreshCw, Search, Square, Terminal } from 'lucide-react'
+import { Activity, BookOpenText, Database, FileText, LoaderCircle, MessageSquare, Network, PencilLine, Play, RefreshCw, Search, Settings, Square, Terminal, Workflow } from 'lucide-react'
 import { api } from './api'
-import { generationProgress } from './jobProgress'
+import { JobBanner } from './JobBanner'
 import type { Artifact, Job, RunSummary } from './types'
 import { useJobEvents } from './useJobEvents'
 import './App.css'
 
-type View = 'workspace' | 'editor' | 'analysis' | 'runs' | 'jobs'
-// Topic charts and canvas graph dependencies are large, so keep them out of the
-// initial manuscript-workspace bundle until the Analysis navigation is selected.
+type View = 'pipeline' | 'workspace' | 'editor' | 'analysis' | 'chat' | 'jobs' | 'settings'
+// Fallbacks while /api/models is loading (or for a server too old to have it):
+// the same curated lists this used to hardcode permanently. The Settings page
+// now owns the real catalog, including any models added there.
+const WRITER_MODELS = [
+  { value: 'Qwen/Qwen2.5-7B-Instruct', label: 'Local GPU · Qwen2.5 7B' },
+  { value: 'Qwen/Qwen2.5-14B-Instruct', label: 'Local GPU · Qwen2.5 14B' },
+  { value: 'claude-opus-5', label: 'Claude API · Opus 5' },
+  { value: 'claude-sonnet-5', label: 'Claude API · Sonnet 5' },
+]
+const EMBEDDING_MODELS = [
+  { value: 'BAAI/bge-large-en-v1.5', label: 'BGE large · best quality' },
+  { value: 'BAAI/bge-base-en-v1.5', label: 'BGE base · faster' },
+  { value: 'all-MiniLM-L6-v2', label: 'MiniLM · fastest' },
+]
+// Topic charts, canvas graph, and pipeline-status dependencies are lazy so the
+// initial manuscript-workspace bundle stays small until each tab is selected.
+const PipelineView = lazy(() => import('./PipelineView').then((module) => ({ default: module.PipelineView })))
 const AnalysisView = lazy(() => import('./AnalysisView').then((module) => ({ default: module.AnalysisView })))
+const ChatView = lazy(() => import('./ChatView').then((module) => ({ default: module.ChatView })))
 const WorkspaceEditor = lazy(() => import('./editor/WorkspaceEditor').then((module) => ({ default: module.WorkspaceEditor })))
+const SettingsView = lazy(() => import('./SettingsView').then((module) => ({ default: module.SettingsView })))
 
 const formatDate = (value?: string | null) => value
   ? new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value))
@@ -21,9 +38,12 @@ function App() {
   const queryClient = useQueryClient()
   // Local state is limited to navigation and selections. Durable workflow state
   // lives in FastAPI/data directories and server state is owned by TanStack Query.
-  const [view, setView] = useState<View>('workspace')
+  const [view, setView] = useState<View>('pipeline')
   const [system, setSystem] = useState('Universal Metaphysics')
   const [cachePath, setCachePath] = useState('')
+  const [modelName, setModelName] = useState(WRITER_MODELS[0].value)
+  const [embeddingModel, setEmbeddingModel] = useState(EMBEDDING_MODELS[0].value)
+  const provider = modelName.toLowerCase().startsWith('claude') ? 'claude' : 'local'
   const [activeJobId, setActiveJobId] = useState<string | null>(null)
   const [submittedJob, setSubmittedJob] = useState<Job | null>(null)
   const [artifact, setArtifact] = useState<Artifact | null>(null)
@@ -37,6 +57,15 @@ function App() {
   const runs = useQuery({ queryKey: ['runs'], queryFn: api.runs, refetchInterval: 5000 })
   const jobs = useQuery({ queryKey: ['jobs'], queryFn: api.jobs, refetchInterval: 3000 })
   const caches = useQuery({ queryKey: ['caches', system], queryFn: () => api.caches(system) })
+  // The Settings page manages this catalog; everywhere else just reads it,
+  // falling back to the old hardcoded lists until it loads at least once.
+  const modelsQuery = useQuery({ queryKey: ['models'], queryFn: api.models, refetchInterval: 10000 })
+  const writerModelOptions = modelsQuery.data
+    ? modelsQuery.data.filter((entry) => entry.kind === 'generation').map((entry) => ({ value: entry.value, label: entry.label }))
+    : WRITER_MODELS
+  const embeddingModelOptions = modelsQuery.data
+    ? modelsQuery.data.filter((entry) => entry.kind === 'embedding').map((entry) => ({ value: entry.value, label: entry.label }))
+    : EMBEDDING_MODELS
 
   const track = (job: Job) => {
     // Opening the drawer immediately gives queued work visible feedback while
@@ -46,11 +75,11 @@ function App() {
     void queryClient.invalidateQueries({ queryKey: ['jobs'] })
   }
   const indexMutation = useMutation({ mutationFn: api.startIndex, onSuccess: track })
-  const outlineMutation = useMutation({ mutationFn: () => api.startOutline(system, cachePath || undefined), onSuccess: track })
+  const outlineMutation = useMutation({ mutationFn: () => api.startOutline(system, cachePath || undefined, provider, modelName), onSuccess: track })
   const manuscriptMutation = useMutation({
     // Supplying a run resumes its progress.json; omitting it creates a fresh,
     // timestamped run using either the selected plan cache or regenerated plans.
-    mutationFn: (run?: RunSummary) => api.startManuscript(system, run?.run_id, run ? undefined : cachePath || undefined),
+    mutationFn: (run?: RunSummary) => api.startManuscript(system, run?.run_id, run ? undefined : cachePath || undefined, provider, modelName),
     onSuccess: track,
   })
   const cancelMutation = useMutation({ mutationFn: api.cancelJob })
@@ -66,60 +95,67 @@ function App() {
   const generationJob = polledGenerationJob?.status === 'running'
     ? polledGenerationJob
     : trackedGenerationJob ?? polledGenerationJob
-  const generation = generationJob ? generationProgress(generationJob) : null
 
   const filteredRuns = (runs.data ?? []).filter((run) => {
     const needle = search.toLowerCase()
     return !needle || run.system.toLowerCase().includes(needle) || run.run_id.toLowerCase().includes(needle)
   })
-  const openArtifact = async (run: RunSummary, kind: Artifact['kind']) => setArtifact(await api.artifact(run.run_id, run.system, kind))
+  const openArtifactByIds = async (runId: string, runSystem: string, kind: Artifact['kind']) => setArtifact(await api.artifact(runId, runSystem, kind))
+  const openArtifact = (run: RunSummary, kind: Artifact['kind']) => openArtifactByIds(run.run_id, run.system, kind)
 
   return <div className="app-shell">
     <aside className="sidebar">
       <div className="brand"><img className="brand-icon" src="/favicon.svg" alt="" /><span>Ogma</span></div>
       <nav>
+        <button className={view === 'pipeline' ? 'active' : ''} onClick={() => setView('pipeline')}><Workflow /> Pipeline</button>
         <button className={view === 'workspace' ? 'active' : ''} onClick={() => setView('workspace')}><Activity /> Workspace</button>
         <button className={view === 'editor' ? 'active' : ''} onClick={() => setView('editor')}><PencilLine /> Editor</button>
         <button className={view === 'analysis' ? 'active' : ''} onClick={() => setView('analysis')}><Network /> Analysis</button>
-        <button className={view === 'runs' ? 'active' : ''} onClick={() => setView('runs')}><Library /> Run library</button>
+        <button className={view === 'chat' ? 'active' : ''} onClick={() => setView('chat')}><MessageSquare /> Chat</button>
         <button className={view === 'jobs' ? 'active' : ''} onClick={() => setView('jobs')}><Terminal /> Job console</button>
+        <button className={view === 'settings' ? 'active' : ''} onClick={() => setView('settings')}><Settings /> Settings</button>
       </nav>
       <div className="sidebar-foot"><span className={`status-dot ${index.data?.available ? 'online' : ''}`} />{index.data?.available ? 'Index online' : 'Index unavailable'}</div>
     </aside>
 
     <main className={view === 'editor' ? 'editor-main' : ''}>
       <header className="topbar">
-        <div><p className="eyebrow">Local semantic workspace</p><h1>{view === 'workspace' ? 'Manuscript operations' : view === 'editor' ? 'Markdown editor' : view === 'analysis' ? 'Corpus intelligence' : view === 'runs' ? 'Generated library' : 'Background jobs'}</h1></div>
-        {view !== 'editor' && <div className="search"><Search size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Filter runs" /></div>}
+        <div><p className="eyebrow">Local semantic workspace</p><h1>{view === 'pipeline' ? 'Pipeline overview' : view === 'workspace' ? 'Manuscript operations' : view === 'editor' ? 'Markdown editor' : view === 'analysis' ? 'Corpus intelligence' : view === 'chat' ? 'Notes chat' : view === 'settings' ? 'Settings' : 'Background jobs'}</h1></div>
+        {view === 'workspace' && <div className="search"><Search size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Filter runs" /></div>}
       </header>
 
+      {view === 'pipeline' && <Suspense fallback={<section className="panel analysis-empty">Loading pipeline...</section>}><PipelineView
+        jobs={jobs.data ?? []} onTrack={track} onOpenJob={setActiveJobId} onNavigate={setView}
+        writerModels={writerModelOptions} embeddingModels={embeddingModelOptions}
+        modelName={modelName} onModelNameChange={setModelName}
+        embeddingModel={embeddingModel} onEmbeddingModelChange={setEmbeddingModel}
+        onOpenArtifact={openArtifactByIds}
+      /></Suspense>}
       {view === 'workspace' && <>
         <section className="metrics">
           <div><Database /><span>Indexed chunks</span><strong>{index.data?.total_chunks?.toLocaleString() ?? '24,818'}</strong><small>{formatDate(index.data?.completed_at ?? index.data?.database_modified_at)}</small></div>
           <div><BookOpenText /><span>Available texts</span><strong>{systems.data?.length ?? 3}</strong><small>{systems.data?.reduce((sum, item) => sum + item.sections, 0) ?? 147} sections</small></div>
           <div><FileText /><span>Generated runs</span><strong>{runs.data?.length ?? 0}</strong><small>{jobs.data?.filter((job) => job.status === 'running').length ?? 0} active jobs</small></div>
         </section>
-        {generationJob && generation && <section className={`panel analysis-progress generation-progress ${generationJob.status}`}>
-          <div className="progress-icon">{generationJob.status === 'running' ? <LoaderCircle className="spin" /> : <Clock3 />}</div>
-          <div className="progress-copy"><div><strong>{generation.label}</strong><span>{generation.percent}%</span></div><div className="progress-track"><i style={{ width: `${generation.percent}%` }} /></div><p>{generation.detail}</p>{generationJob.run_id && <code>{generationJob.run_id} · {generationJob.system}</code>}</div>
-          <div className="progress-actions"><button onClick={() => setActiveJobId(generationJob.id)}><Terminal /> Logs</button><button className="stop" onClick={() => cancelMutation.mutate(generationJob.id)}><Square /> Stop</button></div>
-        </section>}
+        {generationJob && <JobBanner job={generationJob} onOpenLogs={setActiveJobId} onCancel={cancelMutation.mutate} className="generation-progress" />}
         <section className="workspace-grid">
           <div className="panel controls-panel">
             <div className="panel-title"><div><p className="eyebrow">Pipeline</p><h2>Build a text</h2></div><button className="icon-button" title="Refresh" onClick={() => void queryClient.invalidateQueries()}><RefreshCw /></button></div>
             <label>Source text<select value={system} onChange={(event) => { setSystem(event.target.value); setCachePath('') }}>{systems.data?.map((item) => <option key={item.name}>{item.name}</option>)}</select></label>
+            <label>Writer<select value={modelName} onChange={(event) => setModelName(event.target.value)}>{writerModelOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
             <label>Writing plan<select value={cachePath} onChange={(event) => setCachePath(event.target.value)}><option value="">Regenerate from indexed notes</option>{caches.data?.map((cache) => <option key={cache.path} value={cache.path}>{formatDate(cache.modified_at)} · {cache.sections} sections</option>)}</select></label>
             <div className="action-stack"><button onClick={() => outlineMutation.mutate()}><Play /> Generate outline</button><button className="primary" onClick={() => manuscriptMutation.mutate(undefined)}><BookOpenText /> Outline + manuscript</button></div>
             <div className="divider" />
             <div className="index-row"><div><strong>Source index</strong><span>{index.data?.available ? 'Ready for retrieval' : 'Needs indexing'}</span></div><button className="secondary" onClick={() => indexMutation.mutate()}><Database /> Reindex notes</button></div>
           </div>
-          <div className="panel recent-panel"><div className="panel-title"><div><p className="eyebrow">Recent</p><h2>Generation runs</h2></div><button className="text-button" onClick={() => setView('runs')}>View all</button></div><RunTable runs={filteredRuns.slice(0, 5)} onArtifact={openArtifact} onContinue={(run) => { setSystem(run.system); manuscriptMutation.mutate(run) }} /></div>
+          <div className="panel recent-panel"><div className="panel-title"><div><p className="eyebrow">Recent</p><h2>Generation runs</h2></div><button className="text-button" onClick={() => setView('pipeline')}>View all</button></div><RunTable runs={filteredRuns.slice(0, 5)} onArtifact={openArtifact} onContinue={(run) => { setSystem(run.system); manuscriptMutation.mutate(run) }} /></div>
         </section>
       </>}
       {view === 'editor' && <Suspense fallback={<section className="panel analysis-empty">Loading editor...</section>}><WorkspaceEditor /></Suspense>}
-      {view === 'analysis' && <Suspense fallback={<section className="panel analysis-empty">Loading analysis tools...</section>}><AnalysisView jobs={jobs.data ?? []} onTrack={track} onOpenJob={setActiveJobId} /></Suspense>}
-      {view === 'runs' && <section className="panel full-panel"><RunTable runs={filteredRuns} onArtifact={openArtifact} onContinue={(run) => { setSystem(run.system); manuscriptMutation.mutate(run) }} /></section>}
+      {view === 'analysis' && <Suspense fallback={<section className="panel analysis-empty">Loading analysis tools...</section>}><AnalysisView jobs={jobs.data ?? []} onTrack={track} onOpenJob={setActiveJobId} embeddingModels={embeddingModelOptions} embeddingModel={embeddingModel} onEmbeddingModelChange={setEmbeddingModel} /></Suspense>}
+      {view === 'chat' && <Suspense fallback={<section className="panel analysis-empty">Loading chat...</section>}><ChatView jobs={jobs.data ?? []} onTrack={track} onOpenJob={setActiveJobId} /></Suspense>}
       {view === 'jobs' && <section className="panel full-panel"><JobTable jobs={jobs.data ?? []} onSelect={(job) => setActiveJobId(job.id)} /></section>}
+      {view === 'settings' && <Suspense fallback={<section className="panel analysis-empty">Loading settings...</section>}><SettingsView jobs={jobs.data ?? []} onTrack={track} onOpenJob={setActiveJobId} onCancel={cancelMutation.mutate} /></Suspense>}
     </main>
 
     {activeJobId && <aside className="drawer job-drawer"><div className="drawer-head"><div><p className="eyebrow">Live process</p><h2>{activeJob?.kind ?? 'Queued job'}</h2></div><button className="icon-button" onClick={() => setActiveJobId(null)}>×</button></div><div className={`job-state ${activeJob?.status ?? 'queued'}`}>{activeJob?.status === 'running' && <LoaderCircle className="spin" />}{activeJob?.status ?? 'connecting'}</div><pre>{activeJob?.logs.join('\n') || 'Waiting for output...'}</pre>{activeJob?.status === 'running' && <button className="danger" onClick={() => cancelMutation.mutate(activeJob.id)}><Square /> Stop job</button>}</aside>}
